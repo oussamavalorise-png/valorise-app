@@ -77,20 +77,44 @@ export async function uploadPhotos(bucket: string, folder: string, files: FileLi
   return paths;
 }
 
-/** Appelle la fonction Edge « admin-users » (création de comptes, mots de passe, activation). */
+/**
+ * Comptes (création, mot de passe, activation). Utilise les fonctions SQL si le script des comptes a été lancé,
+ * sinon la fonction Edge « admin-users ».
+ */
 export async function adminUsers(body: Record<string, unknown>) {
+  const str = (v: unknown) => (v == null || v === '' ? null : String(v));
+  const { data, error } = body.action === 'create'
+    ? await supabase.rpc('admin_creer_compte', {
+      p_username: str(body.username), p_password: str(body.password), p_full_name: str(body.full_name), p_role: str(body.role) ?? 'chauffeur',
+      p_phone: str(body.phone), p_service: str(body.service), p_manager_id: str(body.manager_id), p_demandeur_autorise: Boolean(body.demandeur_autorise),
+    })
+    : body.action === 'set_password'
+      ? await supabase.rpc('admin_mot_de_passe', { p_user_id: body.user_id, p_password: str(body.password) })
+      : await supabase.rpc('admin_activer_compte', { p_user_id: body.user_id, p_active: Boolean(body.active) });
+  if (!error) return data;
+  if (error.code !== 'PGRST202') throw new Error(error.message);
+  return adminUsersEdge(body);
+}
+
+/** Fonction Edge « admin-users » : affiche la vraie cause en cas d'erreur. */
+async function adminUsersEdge(body: Record<string, unknown>) {
   const { data, error } = await supabase.functions.invoke('admin-users', { body });
-  if (error) {
-    const ctx = (error as { context?: Response }).context;
-    let msg = error.message;
-    if (ctx && typeof ctx.json === 'function') {
-      try {
-        msg = ((await ctx.json()) as { error?: string }).error ?? msg;
-      } catch {
-        /* réponse non JSON */
-      }
-    }
-    throw new Error(msg);
+  if (!error) return data;
+  const ctx = (error as { context?: Response }).context;
+  if (!(ctx instanceof Response)) {
+    throw new Error("Fonction « admin-users » injoignable : vérifiez dans Supabase → Edge Functions que son adresse se termine par /functions/v1/admin-users.");
   }
-  return data;
+  let detail = '';
+  try {
+    const j = (await ctx.clone().json()) as { error?: string; message?: string; msg?: string };
+    detail = j.error ?? j.message ?? j.msg ?? '';
+  } catch {
+    detail = (await ctx.text().catch(() => '')).slice(0, 200);
+  }
+  const aide = ctx.status === 404
+    ? ' → La fonction « admin-users » est introuvable : son adresse doit se terminer par /functions/v1/admin-users.'
+    : ctx.status === 401
+      ? ' → Dans Supabase → Edge Functions → admin-users → Details, désactivez « Verify JWT » puis enregistrez.'
+      : '';
+  throw new Error(`Erreur ${ctx.status}${detail ? ` : ${detail}` : ''}${aide}`);
 }
